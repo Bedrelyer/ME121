@@ -1,0 +1,114 @@
+```{r}
+# ----------------- 初始化环境 -----------------
+# install.packages(c("tidyverse", "minpack.lm", "signal")) # 如首次使用请取消注释
+library(tidyverse)
+library(minpack.lm) 
+library(signal)
+
+# 阻尼余弦函数
+damped_cosine <- function(t, A, gamma, omega, phi, offset) {
+  A * exp(-gamma * t) * cos(omega * t + phi) + offset
+}
+
+# 设定根目录
+root_dir <- "./"
+folders <- list.dirs(root_dir, recursive = FALSE)
+
+# 汇总结构
+all_fits <- list()
+autocorr_peaks <- list()
+resonance_peaks <- list()
+
+# ----------------- 遍历每个实验 -----------------
+for (folder in folders) {
+  message("处理文件夹: ", folder)
+  
+  file_raw <- file.path(folder, "Raw Data.csv")
+  
+  if (!file.exists(file_raw)) next
+    
+  df_raw <- read_csv(file_raw, show_col_types = FALSE) %>%
+    rename_with(str_trim) %>%
+    rename(time = matches("Time"),
+           az = matches("y")) %>%
+    drop_na(time, az)
+  
+  df_raw <- as.data.frame(df_raw)
+  df_raw$time <- as.numeric(df_raw$time)
+  df_raw$az <- as.numeric(df_raw$az)
+  
+  t0 <- min(df_raw$time)
+  t_max <- max(df_raw$time)
+  duration <- min(15, t_max - t0)
+  df_raw <- df_raw[df_raw$time >= t0 & df_raw$time <= (t0 + duration), ]
+
+  t_uniform <- seq(min(df_raw$time), max(df_raw$time), length.out = 500)
+  az_interp <- approx(df_raw$time, df_raw$az, xout = t_uniform)$y
+  
+  dt <- mean(diff(t_uniform))
+  az_detrend <- az_interp - mean(az_interp)
+  fft_val <- fft(az_detrend)
+  freq <- seq(0, 1 / (2 * dt), length.out = length(fft_val) / 2)
+  amp <- Mod(fft_val)[1:(length(freq))]
+  dom_idx <- which.max(amp)
+  dom_freq <- freq[dom_idx]
+  omega0 <- 2 * pi * dom_freq
+  
+  guess <- list(A = max(az_interp), gamma = 1, omega = omega0, phi = 0, offset = mean(az_interp))
+  
+  fit <- try(nlsLM(az ~ damped_cosine(t, A, gamma, omega, phi, offset),
+                   data = tibble(t = t_uniform - t0, az = az_interp),
+                   start = guess), silent = TRUE)
+  if (inherits(fit, "try-error")) next
+
+  coef_val <- coef(fit)
+  coef_err <- summary(fit)$parameters[, "Std. Error"]
+  Q <- coef_val["omega"] / (2 * coef_val["gamma"])
+
+  t_fit <- seq(min(t_uniform), max(t_uniform), length.out = 500)
+  fit_y <- do.call(damped_cosine, c(list(t = t_fit - t0), as.list(coef_val)))
+  df_plot <- tibble(t = c(t_uniform, t_fit),
+                    az = c(az_interp, fit_y),
+                    type = rep(c("data", "fit"), each = 500))
+  
+  df_plot$type <- factor(df_plot$type, levels = c("data", "fit"))
+
+  p <- ggplot(df_plot, aes(x = t, y = az, color = type, linetype = type, linewidth = type)) +
+    geom_line() +
+    labs(title = paste("Fitting:", basename(folder)),
+         x = "Time (s)", y = "Acceleration z (m/s²)") +
+    scale_color_manual(values = c("data" = "blue", "fit" = "red")) +
+    scale_linetype_manual(values = c("data" = "solid", "fit" = "solid")) +
+    scale_linewidth_manual(values = c("data" = 1, "fit" = 0.5)) +
+    theme_minimal()
+
+  ggsave(file.path(folder, "fit_plot.png"), plot = p, width = 6, height = 4)
+  
+  m <- 0.21134  # 质量，单位 kg
+  
+  omega_n <- sqrt(coef_val["omega"]^2 + coef_val["gamma"]^2)
+  k <- m * omega_n^2
+  b <- 2 * m * coef_val["gamma"]
+  zeta <- coef_val["gamma"] / omega_n
+  
+  all_fits[[basename(folder)]] <- tibble(
+    Folder = basename(folder),
+    A = coef_val["A"], A_err = coef_err["A"],
+    gamma = coef_val["gamma"], gamma_err = coef_err["gamma"],
+    omega = coef_val["omega"], omega_err = coef_err["omega"],
+    phi = coef_val["phi"], phi_err = coef_err["phi"],
+    offset = coef_val["offset"], offset_err = coef_err["offset"],
+    dom_freq = dom_freq, Q = Q,
+    k = k, b = b, zeta = zeta, omega_n = omega_n
+  )
+
+
+}
+
+# ----------------- 汇总并导出 -----------------
+results <- bind_rows(all_fits)
+write_csv(results, file.path(root_dir, "spring_model_results_summary.csv"))
+
+print(results)
+print(p)
+```
